@@ -1,0 +1,95 @@
+name: Build patched AmneziaVPN 4.8.21.0 (Windows)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows:
+    runs-on: windows-2022
+    timeout-minutes: 180
+    env:
+      QT_VERSION: "6.10.1"
+      QIF_VERSION: "4.7"
+      BUILD_ARCH: "64"
+      QT_MIRROR: "https://mirrors.ocf.berkeley.edu/qt/"
+
+    steps:
+      - name: Checkout workflow branch (without large submodules)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: false
+
+      - name: Save patch and checkout exact upstream tag
+        shell: pwsh
+        run: |
+          $patchInRepo = Join-Path $env:GITHUB_WORKSPACE "windowsroutemonitor-4.8.21.0.patch"
+          if (-not (Test-Path $patchInRepo)) {
+            throw "Patch file not found at repository root: windowsroutemonitor-4.8.21.0.patch"
+          }
+          $patchCopy = Join-Path $env:RUNNER_TEMP "windowsroutemonitor-4.8.21.0.patch"
+          Copy-Item $patchInRepo $patchCopy -Force
+          git fetch https://github.com/amnezia-vpn/amnezia-client.git refs/tags/4.8.21.0:refs/tags/4.8.21.0
+          git checkout --detach 4.8.21.0
+          git apply --check $patchCopy
+          git apply $patchCopy
+          git submodule update --init --recursive
+          git diff --check
+          git diff --stat
+
+      - name: Install Qt and Qt Installer Framework
+        uses: jurplel/install-qt-action@v3
+        with:
+          version: ${{ env.QT_VERSION }}
+          host: windows
+          target: desktop
+          arch: win64_msvc2022_64
+          modules: qtremoteobjects qt5compat qtshadertools
+          dir: ${{ runner.temp }}
+          setup-python: true
+          tools: tools_ifw
+          set-env: true
+          aqtversion: "==3.3.0"
+          py7zrversion: "==0.22.*"
+          extra: "--base ${{ env.QT_MIRROR }}"
+
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Install WiX Toolset
+        shell: pwsh
+        run: |
+          dotnet tool install --global wix --version 4.0.6
+          wix extension add -g WixToolset.UI.wixext/4.0.6
+          wix extension add -g WixToolset.Util.wixext/4.0.6
+          "WIX_BIN_DIR=$env:USERPROFILE\.dotnet\tools" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Build unsigned Windows installers
+        shell: cmd
+        env:
+          QT_BIN_DIR: ${{ runner.temp }}\Qt\${{ env.QT_VERSION }}\msvc2022_64\bin
+          QIF_BIN_DIR: ${{ runner.temp }}\Qt\Tools\QtInstallerFramework\${{ env.QIF_VERSION }}\bin
+        run: |
+          call deploy\build_windows.bat
+
+      - name: Upload installer artifacts
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: AmneziaVPN-4.8.21.0-patched-Windows-x64
+          path: |
+            AmneziaVPN_x64.exe
+            AmneziaVPN_x64.msi
+            deploy/build_64/client/release/**
+          if-no-files-found: error
+          retention-days: 7
