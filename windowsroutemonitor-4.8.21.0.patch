@@ -1,0 +1,51 @@
+--- a/client/platforms/windows/daemon/windowsroutemonitor.cpp
++++ b/client/platforms/windows/daemon/windowsroutemonitor.cpp
+@@ -259,9 +259,12 @@
+   PMIB_IPFORWARD_TABLE2 table;
+   DWORD error = GetIpForwardTable2(family, &table);
+   if (error != NO_ERROR) {
+-    updateCapturedRoutes(family, table);
+-    FreeMibTable(table);
+-  }
++    logger.error() << "Failed to fetch routing table:" << error;
++    return;
++  }
++
++  updateCapturedRoutes(family, table);
++  FreeMibTable(table);
+ }
+ 
+ void WindowsRouteMonitor::updateCapturedRoutes(int family, void* ptable) {
+@@ -276,8 +279,18 @@
+     if (row->InterfaceLuid.Value == m_luid) {
+       continue;
+     }
+-    // Ignore the default route
++    // Ignore the default route.
+     if (row->DestinationPrefix.PrefixLength == 0) {
++      continue;
++    }
++    // Do not capture directly connected (on-link) routes into the VPN.
++    // Their next hop is unspecified/zero; cloning them onto the VPN
++    // interface breaks access to the local LAN and other attached networks.
++    if (row->NextHop.si_family == AF_UNSPEC ||
++        (row->NextHop.si_family == AF_INET &&
++         row->NextHop.Ipv4.sin_addr.s_addr == INADDR_ANY) ||
++        (row->NextHop.si_family == AF_INET6 &&
++         IN6_IS_ADDR_UNSPECIFIED(&row->NextHop.Ipv6.sin6_addr))) {
+       continue;
+     }
+     // Ignore routes of our own creation.
+@@ -424,11 +437,11 @@
+     return false;
+   }
+   updateInterfaceMetrics(family);
++  m_exclusionRoutes[prefix] = data;
+   updateCapturedRoutes(family, table);
+   updateExclusionRoute(data, table);
+   FreeMibTable(table);
+ 
+-  m_exclusionRoutes[prefix] = data;
+   return true;
+ }
+ 
