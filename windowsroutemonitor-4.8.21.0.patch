@@ -1,51 +1,502 @@
+diff --git a/client/platforms/windows/daemon/windowsroutecapturepolicy.h b/client/platforms/windows/daemon/windowsroutecapturepolicy.h
+new file mode 100644
+index 0000000..571b22b
+--- /dev/null
++++ b/client/platforms/windows/daemon/windowsroutecapturepolicy.h
+@@ -0,0 +1,259 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#ifndef WINDOWSROUTECAPTUREPOLICY_H
++#define WINDOWSROUTECAPTUREPOLICY_H
++
++#include <winsock2.h>
++#include <WS2tcpip.h>
++#include <ws2ipdef.h>
++#include <windows.h>
++#include <iphlpapi.h>
++
++#include <QByteArray>
++#include <QHash>
++#include <QSet>
++#include <cstring>
++
++namespace WindowsRouteCapturePolicy {
++
++inline bool isVpnInterfaceRoute(const MIB_IPFORWARD_ROW2* row,
++                                unsigned long long vpnLuid) {
++  return row->InterfaceLuid.Value == vpnLuid;
++}
++
++inline bool isDefaultRoute(const MIB_IPFORWARD_ROW2* row) {
++  return row->DestinationPrefix.PrefixLength == 0;
++}
++
++inline bool isRouteCreatedByMonitor(const MIB_IPFORWARD_ROW2* row,
++                                    ULONG monitorMetric) {
++  return row->Protocol == MIB_IPPROTO_NETMGMT && row->Metric == monitorMetric;
++}
++
++inline bool isIpv6Unspecified(const IN6_ADDR& address) {
++  static const IN6_ADDR unspecified = {};
++  return std::memcmp(&address, &unspecified, sizeof(unspecified)) == 0;
++}
++
++inline bool isOnLinkRoute(const MIB_IPFORWARD_ROW2* row) {
++  if (row->NextHop.si_family == AF_UNSPEC) {
++    return true;
++  }
++
++  if (row->NextHop.si_family == AF_INET) {
++    return row->NextHop.Ipv4.sin_addr.s_addr == 0;
++  }
++
++  if (row->NextHop.si_family == AF_INET6) {
++    return isIpv6Unspecified(row->NextHop.Ipv6.sin6_addr);
++  }
++
++  return false;
++}
++
++inline quint32 ipv4Network(const IN_ADDR& address, int prefixLength) {
++  quint32 network = ntohl(address.s_addr);
++  if (prefixLength <= 0) {
++    return 0;
++  }
++  if (prefixLength >= 32) {
++    return network;
++  }
++  return network & (0xffffffffu << (32 - prefixLength));
++}
++
++inline QByteArray ipv6Network(const IN6_ADDR& address, int prefixLength) {
++  QByteArray network(reinterpret_cast<const char*>(&address), sizeof(address));
++  if (prefixLength <= 0) {
++    network.fill('\0');
++    return network;
++  }
++  if (prefixLength >= 128) {
++    return network;
++  }
++
++  const int fullBytes = prefixLength / 8;
++  const int partialBits = prefixLength % 8;
++  if (partialBits != 0) {
++    const auto value = static_cast<unsigned char>(network.at(fullBytes));
++    const auto mask = static_cast<unsigned char>(0xffu << (8 - partialBits));
++    network[fullBytes] = static_cast<char>(value & mask);
++  }
++  const int zeroFrom = fullBytes + (partialBits != 0 ? 1 : 0);
++  if (zeroFrom < network.size()) {
++    std::memset(network.data() + zeroFrom, 0, network.size() - zeroFrom);
++  }
++  return network;
++}
++
++inline bool addressInPrefix(const SOCKADDR_INET& address,
++                            const IP_ADDRESS_PREFIX& prefix) {
++  if (address.si_family != prefix.Prefix.si_family) {
++    return false;
++  }
++
++  if (address.si_family == AF_INET) {
++    const int length = prefix.PrefixLength;
++    if (length < 0 || length > 32) {
++      return false;
++    }
++    return ipv4Network(address.Ipv4.sin_addr, length) ==
++           ipv4Network(prefix.Prefix.Ipv4.sin_addr, length);
++  }
++
++  if (address.si_family == AF_INET6) {
++    const int length = prefix.PrefixLength;
++    if (length < 0 || length > 128) {
++      return false;
++    }
++    return ipv6Network(address.Ipv6.sin6_addr, length) ==
++           ipv6Network(prefix.Prefix.Ipv6.sin6_addr, length);
++  }
++
++  return false;
++}
++
++inline bool isConnectedLocalRoute(const MIB_IPFORWARD_ROW2* row,
++                                  unsigned long long vpnLuid) {
++  if (isVpnInterfaceRoute(row, vpnLuid) || isDefaultRoute(row) ||
++      row->Loopback) {
++    return false;
++  }
++  // MIB_IPPROTO_LOCAL identifies routes added locally on an interface. Do not
++  // treat arbitrary static routes as connected prefixes.
++  return row->Protocol == MIB_IPPROTO_LOCAL && isOnLinkRoute(row);
++}
++
++// Returns true for a static/manual route whose next hop is reachable through
++// a directly connected prefix on the same physical interface. This is the
++// generic case needed for routes such as 192.168.99.0/24 via 192.168.10.1:
++// the destination is remote, but the gateway is on the physical LAN.
++inline bool hasConnectedPhysicalGateway(
++    const MIB_IPFORWARD_ROW2* row,
++    const MIB_IPFORWARD_TABLE2* table,
++    unsigned long long vpnLuid) {
++  if (!table || row->Protocol != MIB_IPPROTO_NETMGMT ||
++      isVpnInterfaceRoute(row, vpnLuid) || isOnLinkRoute(row) ||
++      row->DestinationPrefix.PrefixLength == 0) {
++    return false;
++  }
++
++  for (ULONG i = 0; i < table->NumEntries; ++i) {
++    const MIB_IPFORWARD_ROW2* connected = &table->Table[i];
++
++    if (connected->InterfaceLuid.Value != row->InterfaceLuid.Value ||
++        !isConnectedLocalRoute(connected, vpnLuid)) {
++      continue;
++    }
++
++    if (addressInPrefix(row->NextHop, connected->DestinationPrefix)) {
++      return true;
++    }
++  }
++
++  return false;
++}
++
++class ConnectedPrefixIndex final {
++ public:
++  void add(const IP_ADDRESS_PREFIX* prefix) {
++    const int prefixLength = prefix->PrefixLength;
++    if (prefix->Prefix.si_family == AF_INET) {
++      if (prefixLength < 0 || prefixLength > 32) {
++        return;
++      }
++      m_ipv4[prefixLength].insert(
++          ipv4Network(prefix->Prefix.Ipv4.sin_addr, prefixLength));
++      return;
++    }
++    if (prefix->Prefix.si_family == AF_INET6) {
++      if (prefixLength < 0 || prefixLength > 128) {
++        return;
++      }
++      m_ipv6[prefixLength].insert(
++          ipv6Network(prefix->Prefix.Ipv6.sin6_addr, prefixLength));
++    }
++  }
++
++  bool contains(const IP_ADDRESS_PREFIX* destination) const {
++    const int destinationLength = destination->PrefixLength;
++    if (destination->Prefix.si_family == AF_INET) {
++      if (destinationLength < 0 || destinationLength > 32) {
++        return false;
++      }
++      for (int prefixLength = destinationLength; prefixLength >= 0;
++           --prefixLength) {
++        auto i = m_ipv4.constFind(prefixLength);
++        if (i == m_ipv4.constEnd()) {
++          continue;
++        }
++        if (i.value().contains(ipv4Network(
++                destination->Prefix.Ipv4.sin_addr, prefixLength))) {
++          return true;
++        }
++      }
++      return false;
++    }
++    if (destination->Prefix.si_family == AF_INET6) {
++      if (destinationLength < 0 || destinationLength > 128) {
++        return false;
++      }
++      for (int prefixLength = destinationLength; prefixLength >= 0;
++           --prefixLength) {
++        auto i = m_ipv6.constFind(prefixLength);
++        if (i == m_ipv6.constEnd()) {
++          continue;
++        }
++        if (i.value().contains(ipv6Network(
++                destination->Prefix.Ipv6.sin6_addr, prefixLength))) {
++          return true;
++        }
++      }
++    }
++
++    return false;
++  }
++
++ private:
++  QHash<int, QSet<quint32>> m_ipv4;
++  QHash<int, QSet<QByteArray>> m_ipv6;
++};
++
++inline bool shouldCaptureRoute(const MIB_IPFORWARD_ROW2* row,
++                               unsigned long long vpnLuid,
++                               bool routeExcluded,
++                               bool destinationOnConnectedNetwork,
++                               ULONG monitorMetric,
++                               bool gatewayOnConnectedPhysicalNetwork = false) {
++  if (isVpnInterfaceRoute(row, vpnLuid)) {
++    return false;
++  }
++  if (isDefaultRoute(row)) {
++    return false;
++  }
++  if (isRouteCreatedByMonitor(row, monitorMetric)) {
++    return false;
++  }
++  if (routeExcluded) {
++    return false;
++  }
++  if (destinationOnConnectedNetwork) {
++    return false;
++  }
++  // Do not capture static routes whose gateway is reachable through the same
++  // directly connected physical interface. No LAN subnet or router IP is
++  // hard-coded; the decision is based on the live Windows routing table.
++  if (gatewayOnConnectedPhysicalNetwork) {
++    return false;
++  }
++  // Directly connected prefixes must remain bound to their real interfaces.
++  if (isOnLinkRoute(row)) {
++    return false;
++  }
++  return true;
++}
++
++}  // namespace WindowsRouteCapturePolicy
++#endif  // WINDOWSROUTECAPTUREPOLICY_H
+diff --git a/client/platforms/windows/daemon/windowsroutemonitor.cpp b/client/platforms/windows/daemon/windowsroutemonitor.cpp
+index 1d0ce4c..13dce75 100644
 --- a/client/platforms/windows/daemon/windowsroutemonitor.cpp
 +++ b/client/platforms/windows/daemon/windowsroutemonitor.cpp
-@@ -259,9 +259,12 @@
-   PMIB_IPFORWARD_TABLE2 table;
+@@ -8,6 +8,7 @@
+ 
+ #include "leakdetector.h"
+ #include "logger.h"
++#include "windowsroutecapturepolicy.h"
+ 
+ namespace {
+ Logger logger("WindowsRouteMonitor");
+@@ -256,12 +257,15 @@ void WindowsRouteMonitor::updateCapturedRoutes(int family) {
+     return;
+   }
+ 
+-  PMIB_IPFORWARD_TABLE2 table;
++  PMIB_IPFORWARD_TABLE2 table = nullptr;
    DWORD error = GetIpForwardTable2(family, &table);
    if (error != NO_ERROR) {
 -    updateCapturedRoutes(family, table);
 -    FreeMibTable(table);
--  }
 +    logger.error() << "Failed to fetch routing table:" << error;
 +    return;
-+  }
+   }
 +
 +  updateCapturedRoutes(family, table);
 +  FreeMibTable(table);
  }
  
  void WindowsRouteMonitor::updateCapturedRoutes(int family, void* ptable) {
-@@ -276,8 +279,18 @@
+@@ -276,8 +280,19 @@ void WindowsRouteMonitor::updateCapturedRoutes(int family, void* ptable) {
      if (row->InterfaceLuid.Value == m_luid) {
        continue;
      }
 -    // Ignore the default route
+-    if (row->DestinationPrefix.PrefixLength == 0) {
 +    // Ignore the default route.
-     if (row->DestinationPrefix.PrefixLength == 0) {
++    if (WindowsRouteCapturePolicy::isDefaultRoute(row)) {
 +      continue;
 +    }
-+    // Do not capture directly connected (on-link) routes into the VPN.
-+    // Their next hop is unspecified/zero; cloning them onto the VPN
-+    // interface breaks access to the local LAN and other attached networks.
-+    if (row->NextHop.si_family == AF_UNSPEC ||
-+        (row->NextHop.si_family == AF_INET &&
-+         row->NextHop.Ipv4.sin_addr.s_addr == INADDR_ANY) ||
-+        (row->NextHop.si_family == AF_INET6 &&
-+         IN6_IS_ADDR_UNSPECIFIED(&row->NextHop.Ipv6.sin6_addr))) {
++    // Keep directly connected/on-link routes on their original interfaces.
++    if (WindowsRouteCapturePolicy::isOnLinkRoute(row)) {
++      continue;
++    }
++    // Do not capture a static route when its gateway is reachable through a
++    // connected prefix on the same physical interface. This is discovered
++    // from the live routing table; no LAN or router addresses are hard-coded.
++    if (WindowsRouteCapturePolicy::hasConnectedPhysicalGateway(
++            row, table, m_luid)) {
        continue;
      }
      // Ignore routes of our own creation.
-@@ -424,11 +437,11 @@
+@@ -424,11 +439,12 @@ bool WindowsRouteMonitor::addExclusionRoute(const IPAddress& prefix) {
      return false;
    }
    updateInterfaceMetrics(family);
++  // Register the exclusion before recapturing routes so the newly excluded
++  // prefix is not cloned into the VPN during this same update.
 +  m_exclusionRoutes[prefix] = data;
    updateCapturedRoutes(family, table);
    updateExclusionRoute(data, table);
    FreeMibTable(table);
- 
+-
 -  m_exclusionRoutes[prefix] = data;
    return true;
  }
  
+diff --git a/tests/windows-route-capture-policy/CMakeLists.txt b/tests/windows-route-capture-policy/CMakeLists.txt
+new file mode 100644
+index 0000000..5e7845b
+--- /dev/null
++++ b/tests/windows-route-capture-policy/CMakeLists.txt
+@@ -0,0 +1,15 @@
++cmake_minimum_required(VERSION 3.21)
++project(AmneziaRouteCapturePolicyTests LANGUAGES CXX)
++
++if(NOT WIN32)
++  message(FATAL_ERROR "These tests use Windows IP Helper API and must run on Windows.")
++endif()
++
++set(CMAKE_CXX_STANDARD 17)
++set(CMAKE_CXX_STANDARD_REQUIRED ON)
++find_package(Qt6 REQUIRED COMPONENTS Core)
++
++enable_testing()
++add_executable(routecapturepolicy_test routecapturepolicy_test.cpp)
++target_link_libraries(routecapturepolicy_test PRIVATE Qt6::Core iphlpapi ws2_32)
++add_test(NAME routecapturepolicy_test COMMAND routecapturepolicy_test)
+diff --git a/tests/windows-route-capture-policy/routecapturepolicy_test.cpp b/tests/windows-route-capture-policy/routecapturepolicy_test.cpp
+new file mode 100644
+index 0000000..9c03de0
+--- /dev/null
++++ b/tests/windows-route-capture-policy/routecapturepolicy_test.cpp
+@@ -0,0 +1,142 @@
++/* Windows-only regression tests for windowsroutecapturepolicy.h.
++ * Build with CMake and run with CTest on Windows. */
++#include <winsock2.h>
++#include <ws2tcpip.h>
++#include <windows.h>
++#include <iphlpapi.h>
++
++#include <cassert>
++#include <cstring>
++#include <iostream>
++#include <memory>
++#include <vector>
++
++#include "../../client/platforms/windows/daemon/windowsroutecapturepolicy.h"
++
++namespace {
++constexpr ULONG64 kPhysicalLuid = 19;
++constexpr ULONG64 kOtherLuid = 27;
++constexpr ULONG64 kVpnLuid = 54;
++
++void setV4(SOCKADDR_INET* address, const char* text) {
++  std::memset(address, 0, sizeof(*address));
++  address->Ipv4.sin_family = AF_INET;
++  assert(InetPtonA(AF_INET, text, &address->Ipv4.sin_addr) == 1);
++}
++
++void setV6(SOCKADDR_INET* address, const char* text) {
++  std::memset(address, 0, sizeof(*address));
++  address->Ipv6.sin6_family = AF_INET6;
++  assert(InetPtonA(AF_INET6, text, &address->Ipv6.sin6_addr) == 1);
++}
++
++void setV4Prefix(IP_ADDRESS_PREFIX* prefix, const char* text, UCHAR length) {
++  std::memset(prefix, 0, sizeof(*prefix));
++  prefix->Prefix.Ipv4.sin_family = AF_INET;
++  assert(InetPtonA(AF_INET, text, &prefix->Prefix.Ipv4.sin_addr) == 1);
++  prefix->PrefixLength = length;
++}
++
++void setV6Prefix(IP_ADDRESS_PREFIX* prefix, const char* text, UCHAR length) {
++  std::memset(prefix, 0, sizeof(*prefix));
++  prefix->Prefix.Ipv6.sin6_family = AF_INET6;
++  assert(InetPtonA(AF_INET6, text, &prefix->Prefix.Ipv6.sin6_addr) == 1);
++  prefix->PrefixLength = length;
++}
++
++void setConnectedV4(MIB_IPFORWARD_ROW2* row, ULONG64 luid,
++                    const char* network, UCHAR length) {
++  InitializeIpForwardEntry(row);
++  row->InterfaceLuid.Value = luid;
++  setV4Prefix(&row->DestinationPrefix, network, length);
++  row->NextHop.si_family = AF_INET;
++  row->NextHop.Ipv4.sin_addr.s_addr = INADDR_ANY;
++  row->Protocol = MIB_IPPROTO_LOCAL;
++}
++
++void setStaticV4(MIB_IPFORWARD_ROW2* row, ULONG64 luid,
++                 const char* destination, UCHAR length, const char* gateway) {
++  InitializeIpForwardEntry(row);
++  row->InterfaceLuid.Value = luid;
++  setV4Prefix(&row->DestinationPrefix, destination, length);
++  setV4(&row->NextHop, gateway);
++  row->Protocol = MIB_IPPROTO_NETMGMT;
++}
++
++void setConnectedV6(MIB_IPFORWARD_ROW2* row, ULONG64 luid,
++                    const char* network, UCHAR length) {
++  InitializeIpForwardEntry(row);
++  row->InterfaceLuid.Value = luid;
++  setV6Prefix(&row->DestinationPrefix, network, length);
++  row->NextHop.si_family = AF_INET6;
++  IN6_ADDR zero{};
++  row->NextHop.Ipv6.sin6_addr = zero;
++  row->Protocol = MIB_IPPROTO_LOCAL;
++}
++
++void setStaticV6(MIB_IPFORWARD_ROW2* row, ULONG64 luid,
++                 const char* destination, UCHAR length, const char* gateway) {
++  InitializeIpForwardEntry(row);
++  row->InterfaceLuid.Value = luid;
++  setV6Prefix(&row->DestinationPrefix, destination, length);
++  setV6(&row->NextHop, gateway);
++  row->Protocol = MIB_IPPROTO_NETMGMT;
++}
++
++struct RouteTable2Rows {
++  std::vector<unsigned char> storage;
++  PMIB_IPFORWARD_TABLE2 table;
++  explicit RouteTable2Rows(size_t count)
++      : storage(sizeof(MIB_IPFORWARD_TABLE2) +
++                (count - 1) * sizeof(MIB_IPFORWARD_ROW2)),
++        table(reinterpret_cast<PMIB_IPFORWARD_TABLE2>(storage.data())) {
++    std::memset(storage.data(), 0, storage.size());
++    table->NumEntries = static_cast<ULONG>(count);
++  }
++};
++
++void testIpv4StaticRouteViaConnectedPhysicalGatewayIsDetected() {
++  RouteTable2Rows routes(2);
++  setConnectedV4(&routes.table->Table[0], kPhysicalLuid, "192.168.10.0", 24);
++  setStaticV4(&routes.table->Table[1], kPhysicalLuid, "192.168.99.0", 24,
++              "192.168.10.1");
++  assert(WindowsRouteCapturePolicy::hasConnectedPhysicalGateway(
++      &routes.table->Table[1], routes.table, kVpnLuid));
++}
++
++void testUnrelatedGatewayIsNotMatched() {
++  RouteTable2Rows routes(2);
++  setConnectedV4(&routes.table->Table[0], kPhysicalLuid, "192.168.10.0", 24);
++  setStaticV4(&routes.table->Table[1], kPhysicalLuid, "172.20.0.0", 16,
++              "172.16.0.1");
++  assert(!WindowsRouteCapturePolicy::hasConnectedPhysicalGateway(
++      &routes.table->Table[1], routes.table, kVpnLuid));
++}
++
++void testIpv6StaticRouteViaConnectedPhysicalGatewayIsDetected() {
++  RouteTable2Rows routes(2);
++  setConnectedV6(&routes.table->Table[0], kPhysicalLuid, "fd00:1::", 64);
++  setStaticV6(&routes.table->Table[1], kPhysicalLuid, "fd00:99::", 64,
++              "fd00:1::1");
++  assert(WindowsRouteCapturePolicy::hasConnectedPhysicalGateway(
++      &routes.table->Table[1], routes.table, kVpnLuid));
++}
++
++void testConnectedPrefixOnDifferentInterfaceDoesNotMatch() {
++  RouteTable2Rows routes(2);
++  setConnectedV4(&routes.table->Table[0], kOtherLuid, "192.168.10.0", 24);
++  setStaticV4(&routes.table->Table[1], kPhysicalLuid, "192.168.99.0", 24,
++              "192.168.10.1");
++  assert(!WindowsRouteCapturePolicy::hasConnectedPhysicalGateway(
++      &routes.table->Table[1], routes.table, kVpnLuid));
++}
++}  // namespace
++
++int main() {
++  testIpv4StaticRouteViaConnectedPhysicalGatewayIsDetected();
++  testUnrelatedGatewayIsNotMatched();
++  testIpv6StaticRouteViaConnectedPhysicalGatewayIsDetected();
++  testConnectedPrefixOnDifferentInterfaceDoesNotMatch();
++  std::cout << "All route-capture policy tests passed.\n";
++  return 0;
++}
